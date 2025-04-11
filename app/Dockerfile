@@ -11,7 +11,7 @@ RUN mkdir -p /app/models
 COPY app/main.py .
 
 # Set environment variables
-ENV WHISPER_MODEL_SIZE=large-v3
+ENV WHISPER_MODEL_SIZE=large-v2
 ENV DEVICE=cuda
 ENV COMPUTE_TYPE=float16
 ENV PORT=8000

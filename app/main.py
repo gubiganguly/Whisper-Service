@@ -16,7 +16,7 @@ import faster_whisper
 logger.add("whisper_service.log", rotation="100 MB")
 
 # Configure model settings from environment variables with defaults
-MODEL_SIZE = os.environ.get("WHISPER_MODEL_SIZE", "large-v3")
+MODEL_SIZE = os.environ.get("WHISPER_MODEL_SIZE", "large-v2")
 # Use CUDA if available, otherwise CPU
 DEVICE = os.environ.get("DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
 # Set computation precision based on device
