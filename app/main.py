@@ -20,7 +20,7 @@ MODEL_SIZE = os.environ.get("WHISPER_MODEL_SIZE", "large-v2")
 # Use CUDA if available, otherwise CPU
 DEVICE = os.environ.get("DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
 # Set computation precision based on device
-COMPUTE_TYPE = os.environ.get("COMPUTE_TYPE", "int8")
+COMPUTE_TYPE = os.environ.get("COMPUTE_TYPE", "float16" if DEVICE == "cuda" else "int8")
 
 # Global model instance
 model = None
