@@ -13,6 +13,8 @@ from typing import Optional
 import faster_whisper
 import asyncio
 import traceback
+import wave
+import tempfile
 
 # Configure logging with rotation to prevent large log files
 logger.add("whisper_service.log", rotation="100 MB")
@@ -145,80 +147,79 @@ async def websocket_transcribe(websocket: WebSocket):
     try:
         logger.info(f"WebSocket connection established: {connection_id}")
         
-        # First receive the message
+        message = await websocket.receive()
+        if isinstance(message, dict) and "bytes" in message:
+            audio_bytes = message["bytes"]
+        else:
+            audio_bytes = message
+        
+        logger.info(f"Processing {len(audio_bytes)} bytes of audio data")
+        
         try:
-            message = await websocket.receive()
-            logger.info(f"Received message type: {type(message)}")
+            # Convert to numpy array
+            audio_np = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
             
-            # Extract audio data based on message format
-            audio_bytes = None
+            # Get sample rate - typically 16000 for Whisper
+            sample_rate = 16000
             
-            if isinstance(message, dict) and "bytes" in message:
-                audio_bytes = message["bytes"]
+            # Process in 30-second chunks for better accuracy
+            chunk_size = 30 * sample_rate
+            transcription = []
+            
+            # If audio is short, process it directly
+            if len(audio_np) <= chunk_size:
+                logger.info("Processing entire audio as a single chunk")
+                segments, info = model.transcribe(
+                    audio_np,
+                    beam_size=5,
+                    language="en",
+                    initial_prompt="This is a clear audio transcription."
+                )
+                text = " ".join([segment.text for segment in list(segments)]).strip()
+                transcription.append(text)
             else:
-                audio_bytes = message
-            
-            logger.info(f"Processing {len(audio_bytes)} bytes of audio data")
-            
-            # Convert to float32 numpy array - try various formats
-            try:
-                # Try as 16-bit PCM (most common for WAV)
-                audio_np = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-                logger.info(f"Audio shape: {audio_np.shape}")
-                
-                # Perform transcription with better parameters
-                try:
-                    logger.info("Starting transcription with improved parameters...")
+                # Process longer audio in chunks
+                logger.info(f"Processing audio in chunks of {chunk_size} samples")
+                for i in range(0, len(audio_np), chunk_size):
+                    chunk = audio_np[i:i + chunk_size]
+                    logger.info(f"Processing chunk {i//chunk_size + 1}, length: {len(chunk)}")
                     
-                    # Better parameters for improved transcription
                     segments, info = model.transcribe(
-                        audio_np,
-                        beam_size=5,           # Larger beam size for better accuracy
-                        language=None,         # Auto-detect language
-                        temperature=0,         # No sampling randomness
-                        compression_ratio_threshold=2.4,  # Filter out non-speech
-                        condition_on_previous_text=True,  # Use previous text for context
-                        initial_prompt="The following is a clear transcription of speech audio:", # Prompt for better quality
-                        word_timestamps=True   # Get word timestamps
+                        chunk,
+                        beam_size=5, 
+                        language="en",
+                        initial_prompt="This is a clear audio transcription."
                     )
                     
-                    # Process segments
-                    segments_list = list(segments)
-                    text = " ".join([segment.text for segment in segments_list]).strip()
+                    chunk_text = " ".join([segment.text for segment in list(segments)]).strip()
+                    if chunk_text:
+                        transcription.append(chunk_text)
                     
-                    # Log details about the transcription
-                    logger.info(f"Detected language: {info.language} (probability: {info.language_probability:.2f})")
-                    logger.info(f"Transcription result: '{text}'")
-                    
-                    # Send success response
-                    await websocket.send_json({
-                        "text": text,
-                        "language": info.language,
-                        "language_probability": info.language_probability,
-                        "isFinal": True,
-                        "type": "transcription"
-                    })
-                    
-                except Exception as e:
-                    logger.error(f"Transcription failed: {e}", exc_info=True)
-                    await websocket.send_json({"error": f"Transcription error: {str(e)}", "type": "error"})
-                
-            except Exception as e:
-                logger.error(f"Audio processing error: {e}", exc_info=True)
-                await websocket.send_json({"error": f"Processing error: {str(e)}", "type": "error"})
-                
-        except Exception as e:
-            logger.error(f"Error receiving message: {e}", exc_info=True)
-            await websocket.send_json({"error": f"Message receiving error: {str(e)}", "type": "error"})
+                    logger.info(f"Chunk {i//chunk_size + 1} transcription: {chunk_text}")
             
-    except WebSocketDisconnect:
-        logger.info(f"WebSocket disconnected: {connection_id}")
+            # Combine all chunks
+            final_text = " ".join(transcription)
+            logger.info(f"Final transcription: {final_text}")
+            
+            # Send response
+            await websocket.send_json({
+                "text": final_text,
+                "type": "transcription",
+                "isFinal": True
+            })
+            
+        except Exception as e:
+            logger.error(f"Processing error: {e}", exc_info=True)
+            await websocket.send_json({"error": str(e), "type": "error"})
+        
     except Exception as e:
         logger.error(f"WebSocket error: {e}", exc_info=True)
     finally:
-        if connection_id in connection_buffers:
-            del connection_buffers[connection_id]
         logger.info(f"WebSocket connection closed: {connection_id}")
+
+    if not is_valid_wav(audio_bytes):
+        logger.info("Converting audio to valid WAV format")
+        audio_bytes = convert_to_valid_format(audio_bytes)
 
 async def connect_to_whisper(audio_data):
     """Connect to external Whisper service and get transcription"""
@@ -257,6 +258,38 @@ async def connect_to_whisper(audio_data):
     except Exception as e:
         logger.error(f"Error connecting to Whisper service: {str(e)}")
         return ""
+
+def is_valid_wav(audio_bytes):
+    """Check if the audio bytes represent a valid WAV file"""
+    try:
+        with tempfile.NamedTemporaryFile(suffix='.wav') as temp:
+            temp.write(audio_bytes)
+            temp.flush()
+            with wave.open(temp.name, 'rb') as wf:
+                return wf.getnchannels() > 0 and wf.getsampwidth() > 0 and wf.getframerate() > 0
+    except Exception:
+        return False
+
+def convert_to_valid_format(audio_bytes):
+    """Convert audio to a format Whisper can understand"""
+    try:
+        # If it's already a valid WAV, return as is
+        if is_valid_wav(audio_bytes):
+            return audio_bytes
+            
+        # Otherwise, try to convert using temporary files
+        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_in:
+            temp_in.write(audio_bytes)
+            temp_in.flush()
+            
+        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_out:
+            os.system(f"ffmpeg -y -i {temp_in.name} -ar 16000 -ac 1 -c:a pcm_s16le {temp_out.name} > /dev/null 2>&1")
+            
+            with open(temp_out.name, 'rb') as f:
+                return f.read()
+    except Exception as e:
+        logger.error(f"Audio conversion error: {e}")
+        return audio_bytes  # Return original if conversion fails
 
 # Run the FastAPI application
 if __name__ == "__main__":
