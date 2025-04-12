@@ -1,7 +1,7 @@
 # Import necessary libraries
 import os
 import time
-from fastapi import FastAPI, WebSocket, HTTPException, Request
+from fastapi import FastAPI, WebSocket, HTTPException, Request, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 import numpy as np
@@ -12,8 +12,7 @@ from pydantic import BaseModel
 from typing import Optional
 import faster_whisper
 import asyncio
-import websockets
-import json
+import traceback
 
 # Configure logging with rotation to prevent large log files
 logger.add("whisper_service.log", rotation="100 MB")
@@ -104,35 +103,20 @@ async def transcribe(request: TranscriptionRequest):
                 "buffer_duration": total_duration
             }
 
-        # Perform transcription with VAD (Voice Activity Detection)
+        # Perform transcription
         segments, info = model.transcribe(
             combined_audio,
             beam_size=5,
             language="en",
             vad_filter=True,
-            vad_parameters=dict(min_silence_duration_ms=500),
-            word_timestamps=True
+            vad_parameters=dict(min_silence_duration_ms=500)
         )
 
         segments_list = list(segments)
-
-        # Fallback transcription with different parameters if no segments detected
-        if not segments_list:
-            segments, info = model.transcribe(
-                combined_audio,
-                beam_size=1,
-                language="en",
-                temperature=0.2,
-                no_speech_threshold=0.3,
-                vad_filter=False
-            )
-            segments_list = list(segments)
-
-        # Combine all segments into final text
         text = " ".join([segment.text for segment in segments_list]).strip()
         logger.info(f"Transcribed: '{text}' from {total_duration:.2f}s audio")
 
-        # Keep only the last 0.5 seconds of audio in buffer
+        # Manage buffer
         if total_duration > 0.5:
             last_samples = int(0.5 * request.sample_rate)
             if len(combined_audio) > last_samples:
@@ -151,162 +135,104 @@ async def transcribe(request: TranscriptionRequest):
         logger.error(f"Error in transcription: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
-# WebSocket endpoint for real-time transcription
+# WebSocket endpoint for binary audio data
 @app.websocket("/ws/transcribe")
 async def websocket_transcribe(websocket: WebSocket):
     global model
     await websocket.accept()
     connection_id = str(id(websocket))
     connection_buffers[connection_id] = []
-
+    
     try:
         logger.info(f"WebSocket connection established: {connection_id}")
         
-        # Main processing loop
-        while True:
+        # Get the first message - should be raw audio bytes
+        try:
+            # Wait for the raw audio data
+            message = await websocket.receive()
+            logger.info(f"Received message type: {type(message)}")
+            
+            # Extract audio data depending on message format
+            audio_bytes = None
+            if isinstance(message, dict) and "bytes" in message:
+                audio_bytes = message["bytes"]
+                logger.info(f"Received {len(audio_bytes)} bytes as 'bytes' key")
+            elif isinstance(message, dict) and "text" in message:
+                logger.info(f"Received text message: {message['text'][:100]}")
+                await websocket.send_json({"text": "", "type": "transcription"})
+                return
+            else:
+                # Try to interpret as raw binary
+                try:
+                    audio_bytes = message
+                    logger.info(f"Treating message as raw binary, {len(audio_bytes)} bytes")
+                except:
+                    logger.error(f"Cannot interpret message: {message}")
+                    await websocket.send_json({"error": "Invalid message format"})
+                    return
+            
+            # Process the audio data
+            logger.info(f"Processing {len(audio_bytes)} bytes of audio data")
+            
+            # Convert to float32 numpy array
             try:
-                # Wait for data with a timeout
-                data = await asyncio.wait_for(websocket.receive(), timeout=30.0)
-                logger.info(f"Received data type: {type(data)}")
+                # Try as 16-bit PCM (common for WAV)
+                audio_np = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+                logger.info(f"Converted audio as int16: shape={audio_np.shape}, range=[{audio_np.min()}, {audio_np.max()}]")
+            except Exception as e:
+                logger.error(f"Error converting audio: {e}")
+                audio_np = np.zeros(1000, dtype=np.float32)  # Fallback to empty audio
+            
+            # Make sure we have enough audio
+            if len(audio_np) < 4000:
+                logger.warning(f"Audio too short: {len(audio_np)} samples")
+                await websocket.send_json({"text": "", "type": "transcription"})
+                return
                 
-                # Process different message types
-                if "text" in data:
-                    # Handle text messages (metadata)
-                    metadata = data["text"]
-                    logger.debug(f"Received text metadata: {metadata}")
-                    
-                elif "bytes" in data:
-                    # Handle binary audio data
-                    audio_bytes = data["bytes"]
-                    logger.info(f"Received {len(audio_bytes)} bytes of audio data")
-                    
-                    # Convert to float32 and normalize
-                    # Try different data types since we don't know the input format
-                    try:
-                        # Try as int16 first
-                        audio_np = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-                    except:
-                        try:
-                            # Try as float32
-                            audio_np = np.frombuffer(audio_bytes, dtype=np.float32)
-                        except:
-                            # Last resort: just try to make it work
-                            audio_np = np.frombuffer(audio_bytes, dtype=np.uint8).astype(np.float32) / 255.0
-                    
-                    # Add to buffer
-                    connection_buffers[connection_id].append(audio_np)
-                    
-                    # Combine audio chunks (up to a reasonable length)
-                    combined_audio = np.concatenate(connection_buffers[connection_id])
-                    
-                    # Skip processing if audio buffer is too small
-                    if len(combined_audio) < 4000:
-                        logger.info(f"Audio too short ({len(combined_audio)} samples), waiting for more data")
-                        await websocket.send_json({
-                            "text": "",
-                            "isFinal": False,
-                            "type": "transcription"
-                        })
-                        continue
-                    
-                    # Log buffer information
-                    logger.info(f"Processing {len(combined_audio)} samples")
-                    
-                    # Perform transcription
-                    try:
-                        segments, info = model.transcribe(
-                            combined_audio,
-                            beam_size=5,
-                            language="en",
-                            vad_filter=True
-                        )
-                        
-                        segments_list = list(segments)
-                        text = " ".join([segment.text for segment in segments_list]).strip()
-                        
-                        # Send transcription result
-                        logger.info(f"WebSocket transcription: '{text}'")
-                        await websocket.send_json({
-                            "text": text,
-                            "isFinal": True,
-                            "type": "transcription"
-                        })
-                        
-                        # Keep only the last portion of audio in buffer to maintain context
-                        if len(combined_audio) > 8000:
-                            connection_buffers[connection_id] = [combined_audio[-8000:]]
-                        else:
-                            connection_buffers[connection_id] = [combined_audio]
-                            
-                    except Exception as e:
-                        logger.error(f"Transcription error: {str(e)}")
-                        await websocket.send_json({
-                            "error": "Transcription failed",
-                            "type": "error"
-                        })
+            # Perform transcription
+            try:
+                logger.info("Starting transcription")
+                segments, info = model.transcribe(
+                    audio_np,
+                    beam_size=5,
+                    language="en"
+                )
                 
-                else:
-                    # Unknown message format
-                    logger.warning(f"Unknown message format received: {data.keys() if isinstance(data, dict) else 'not a dict'}")
-                    # Try to interpret as raw audio if it's not a dict
-                    if not isinstance(data, dict):
-                        try:
-                            # Assume it's raw binary data
-                            audio_bytes = data
-                            audio_np = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-                            connection_buffers[connection_id].append(audio_np)
-                            
-                            # Process as above
-                            combined_audio = np.concatenate(connection_buffers[connection_id])
-                            if len(combined_audio) >= 4000:
-                                segments, info = model.transcribe(
-                                    combined_audio,
-                                    beam_size=5,
-                                    language="en",
-                                    vad_filter=True
-                                )
-                                
-                                segments_list = list(segments)
-                                text = " ".join([segment.text for segment in segments_list]).strip()
-                                
-                                logger.info(f"WebSocket transcription from raw data: '{text}'")
-                                await websocket.send_json({
-                                    "text": text,
-                                    "isFinal": True,
-                                    "type": "transcription"
-                                })
-                                
-                                if len(combined_audio) > 8000:
-                                    connection_buffers[connection_id] = [combined_audio[-8000:]]
-                                else:
-                                    connection_buffers[connection_id] = [combined_audio]
-                        except Exception as e:
-                            logger.error(f"Failed to process unknown data format: {str(e)}")
-                            await websocket.send_json({
-                                "error": "Unknown data format",
-                                "type": "error"
-                            })
+                segments_list = list(segments)
+                text = " ".join([segment.text for segment in segments_list]).strip()
+                logger.info(f"Transcribed: '{text}'")
                 
-            except asyncio.TimeoutError:
-                logger.warning("Timeout waiting for data, closing connection")
+                # Send the result
                 await websocket.send_json({
-                    "error": "Connection timeout",
+                    "text": text,
+                    "isFinal": True,
+                    "type": "transcription"
+                })
+                logger.info("Sent transcription result")
+                
+            except Exception as e:
+                logger.error(f"Transcription error: {str(e)}", exc_info=True)
+                await websocket.send_json({
+                    "error": f"Transcription failed: {str(e)}",
                     "type": "error"
                 })
-                break
                 
+        except Exception as e:
+            logger.error(f"Error processing message: {str(e)}", exc_info=True)
+            await websocket.send_json({
+                "error": f"Message processing failed: {str(e)}",
+                "type": "error"
+            })
+            
+    except WebSocketDisconnect:
+        logger.info(f"WebSocket disconnected: {connection_id}")
     except Exception as e:
         logger.error(f"WebSocket error: {str(e)}", exc_info=True)
         try:
-            await websocket.send_json({
-                "error": str(e),
-                "type": "error"
-            })
+            await websocket.send_json({"error": str(e), "type": "error"})
         except:
             pass
-
     finally:
-        # Clean up connection buffer when WebSocket closes
         if connection_id in connection_buffers:
             del connection_buffers[connection_id]
         logger.info(f"WebSocket connection closed: {connection_id}")
@@ -352,4 +278,4 @@ async def connect_to_whisper(audio_data):
 # Run the FastAPI application
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
