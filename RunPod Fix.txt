@@ -1,0 +1,49 @@
+# RunPod cuDNN Fix for Whisper Service
+
+## Problem
+Error when running faster-whisper on GPU:
+"Could not load library libcudnn_ops_infer.so.8. Error: libcudnn_ops_infer.so.8: cannot open shared object file: No such file or directory"
+
+## Solution - Installing cuDNN Libraries
+
+1. Connect to your RunPod via SSH or Web Terminal
+
+2. Add NVIDIA repositories:
+   wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2004/x86_64/cuda-ubuntu2004.pin
+   sudo mv cuda-ubuntu2004.pin /etc/apt/preferences.d/cuda-repository-pin-600
+   sudo apt-key adv --fetch-keys https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2004/x86_64/3bf863cc.pub
+   sudo add-apt-repository "deb https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2004/x86_64/ /"
+
+3. Install cuDNN:
+   sudo apt-get update
+   sudo apt-get install -y libcudnn8 libcudnn8-dev
+
+4. Verify installation:
+   find /usr -name "libcudnn*"
+
+## Alternative Solutions
+
+### Temporary CPU Fallback
+If you need to get running quickly, edit main.py:
+DEVICE = os.environ.get("DEVICE", "cpu")
+
+### Environment Variable Approach
+Create a launcher script (start.sh):
+#!/bin/bash
+export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
+python main.py
+
+Make executable:
+chmod +x start.sh
+
+Run with:
+./start.sh
+
+### Better RunPod Template
+Use "AUTOMATIC1111 Stable Diffusion" or "ComfyUI" templates which have 
+pre-installed cuDNN libraries.
+
+## Technical Details
+- faster-whisper requires cuDNN for optimized GPU inference
+- libcudnn_ops_infer.so.8 is part of the cuDNN package
+- float16 compute type requires proper GPU libraries

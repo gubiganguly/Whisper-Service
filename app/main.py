@@ -11,6 +11,9 @@ import io
 from pydantic import BaseModel
 from typing import Optional
 import faster_whisper
+import asyncio
+import websockets
+import json
 
 # Configure logging with rotation to prevent large log files
 logger.add("whisper_service.log", rotation="100 MB")
@@ -158,59 +161,193 @@ async def websocket_transcribe(websocket: WebSocket):
 
     try:
         logger.info(f"WebSocket connection established: {connection_id}")
-
+        
+        # Main processing loop
         while True:
-            data = await websocket.receive()
-
-            # Handle metadata messages
-            if "text" in data:
-                metadata = data["text"]
-                logger.debug(f"Received metadata: {metadata}")
-                continue
-
-            # Handle audio data
-            elif "bytes" in data:
-                # Convert and normalize audio data
-                audio_bytes = data["bytes"]
-                audio_np = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-                connection_buffers[connection_id].append(audio_np)
-                combined_audio = np.concatenate(connection_buffers[connection_id])
-
-                # Skip processing if audio buffer is too small
-                if len(combined_audio) < 8000:
-                    continue
-
-                # Perform transcription
-                segments, info = model.transcribe(
-                    combined_audio,
-                    beam_size=5,
-                    language="en",
-                    vad_filter=True
-                )
-
-                segments_list = list(segments)
-                text = " ".join([segment.text for segment in segments_list]).strip()
-
-                # Send transcription result if text is not empty
-                if text:
-                    logger.info(f"WebSocket transcription: '{text}'")
-                    await websocket.send_json({
-                        "text": text,
-                        "isFinal": True,
-                        "type": "transcription"
-                    })
-
-                    # Keep only the last 8000 samples in buffer
-                    connection_buffers[connection_id] = [combined_audio[-8000:]] if len(combined_audio) > 8000 else [combined_audio]
-
+            try:
+                # Wait for data with a timeout
+                data = await asyncio.wait_for(websocket.receive(), timeout=30.0)
+                logger.info(f"Received data type: {type(data)}")
+                
+                # Process different message types
+                if "text" in data:
+                    # Handle text messages (metadata)
+                    metadata = data["text"]
+                    logger.debug(f"Received text metadata: {metadata}")
+                    
+                elif "bytes" in data:
+                    # Handle binary audio data
+                    audio_bytes = data["bytes"]
+                    logger.info(f"Received {len(audio_bytes)} bytes of audio data")
+                    
+                    # Convert to float32 and normalize
+                    # Try different data types since we don't know the input format
+                    try:
+                        # Try as int16 first
+                        audio_np = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+                    except:
+                        try:
+                            # Try as float32
+                            audio_np = np.frombuffer(audio_bytes, dtype=np.float32)
+                        except:
+                            # Last resort: just try to make it work
+                            audio_np = np.frombuffer(audio_bytes, dtype=np.uint8).astype(np.float32) / 255.0
+                    
+                    # Add to buffer
+                    connection_buffers[connection_id].append(audio_np)
+                    
+                    # Combine audio chunks (up to a reasonable length)
+                    combined_audio = np.concatenate(connection_buffers[connection_id])
+                    
+                    # Skip processing if audio buffer is too small
+                    if len(combined_audio) < 4000:
+                        logger.info(f"Audio too short ({len(combined_audio)} samples), waiting for more data")
+                        await websocket.send_json({
+                            "text": "",
+                            "isFinal": False,
+                            "type": "transcription"
+                        })
+                        continue
+                    
+                    # Log buffer information
+                    logger.info(f"Processing {len(combined_audio)} samples")
+                    
+                    # Perform transcription
+                    try:
+                        segments, info = model.transcribe(
+                            combined_audio,
+                            beam_size=5,
+                            language="en",
+                            vad_filter=True
+                        )
+                        
+                        segments_list = list(segments)
+                        text = " ".join([segment.text for segment in segments_list]).strip()
+                        
+                        # Send transcription result
+                        logger.info(f"WebSocket transcription: '{text}'")
+                        await websocket.send_json({
+                            "text": text,
+                            "isFinal": True,
+                            "type": "transcription"
+                        })
+                        
+                        # Keep only the last portion of audio in buffer to maintain context
+                        if len(combined_audio) > 8000:
+                            connection_buffers[connection_id] = [combined_audio[-8000:]]
+                        else:
+                            connection_buffers[connection_id] = [combined_audio]
+                            
+                    except Exception as e:
+                        logger.error(f"Transcription error: {str(e)}")
+                        await websocket.send_json({
+                            "error": "Transcription failed",
+                            "type": "error"
+                        })
+                
+                else:
+                    # Unknown message format
+                    logger.warning(f"Unknown message format received: {data.keys() if isinstance(data, dict) else 'not a dict'}")
+                    # Try to interpret as raw audio if it's not a dict
+                    if not isinstance(data, dict):
+                        try:
+                            # Assume it's raw binary data
+                            audio_bytes = data
+                            audio_np = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+                            connection_buffers[connection_id].append(audio_np)
+                            
+                            # Process as above
+                            combined_audio = np.concatenate(connection_buffers[connection_id])
+                            if len(combined_audio) >= 4000:
+                                segments, info = model.transcribe(
+                                    combined_audio,
+                                    beam_size=5,
+                                    language="en",
+                                    vad_filter=True
+                                )
+                                
+                                segments_list = list(segments)
+                                text = " ".join([segment.text for segment in segments_list]).strip()
+                                
+                                logger.info(f"WebSocket transcription from raw data: '{text}'")
+                                await websocket.send_json({
+                                    "text": text,
+                                    "isFinal": True,
+                                    "type": "transcription"
+                                })
+                                
+                                if len(combined_audio) > 8000:
+                                    connection_buffers[connection_id] = [combined_audio[-8000:]]
+                                else:
+                                    connection_buffers[connection_id] = [combined_audio]
+                        except Exception as e:
+                            logger.error(f"Failed to process unknown data format: {str(e)}")
+                            await websocket.send_json({
+                                "error": "Unknown data format",
+                                "type": "error"
+                            })
+                
+            except asyncio.TimeoutError:
+                logger.warning("Timeout waiting for data, closing connection")
+                await websocket.send_json({
+                    "error": "Connection timeout",
+                    "type": "error"
+                })
+                break
+                
     except Exception as e:
         logger.error(f"WebSocket error: {str(e)}", exc_info=True)
+        try:
+            await websocket.send_json({
+                "error": str(e),
+                "type": "error"
+            })
+        except:
+            pass
 
     finally:
         # Clean up connection buffer when WebSocket closes
         if connection_id in connection_buffers:
             del connection_buffers[connection_id]
         logger.info(f"WebSocket connection closed: {connection_id}")
+
+async def connect_to_whisper(audio_data):
+    """Connect to external Whisper service and get transcription"""
+    try:
+        logger.info(f"Connecting to Whisper service at {WHISPER_SERVICE_URL}")
+        
+        # Debug the audio data
+        logger.info(f"Audio data type: {type(audio_data)}, size: {len(audio_data)} bytes")
+        
+        async with websockets.connect(WHISPER_SERVICE_URL) as whisper_ws:
+            # Send the raw audio bytes
+            await whisper_ws.send(audio_data)
+            logger.info("Audio data sent to Whisper")
+            
+            # Wait for response with timeout
+            try:
+                response = await asyncio.wait_for(whisper_ws.recv(), timeout=15.0)
+                logger.info(f"Got response from Whisper: {response[:100]}...")
+                
+                # Parse the response
+                if isinstance(response, str):
+                    try:
+                        result = json.loads(response)
+                        return result.get("text", "")
+                    except json.JSONDecodeError:
+                        logger.error(f"Invalid JSON: {response[:100]}...")
+                        return ""
+                else:
+                    logger.error(f"Unexpected response type: {type(response)}")
+                    return ""
+                    
+            except asyncio.TimeoutError:
+                logger.error("Timeout waiting for Whisper response")
+                return ""
+                
+    except Exception as e:
+        logger.error(f"Error connecting to Whisper service: {str(e)}")
+        return ""
 
 # Run the FastAPI application
 if __name__ == "__main__":
