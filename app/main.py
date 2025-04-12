@@ -146,97 +146,130 @@ async def websocket_transcribe(websocket: WebSocket):
     try:
         logger.info(f"WebSocket connection established: {connection_id}")
         
-        # Get a single message (we're not expecting multiple messages per connection)
-        message = await websocket.receive()
-        logger.info(f"Received message type: {type(message)}")
-        
-        # Debug message content
-        if isinstance(message, dict):
-            logger.info(f"Message keys: {message.keys()}")
-        else:
-            logger.info(f"Message is not a dict: {type(message)}")
-        
-        # Extract audio data
-        audio_bytes = None
-        if isinstance(message, dict) and "bytes" in message:
-            audio_bytes = message["bytes"]
-            logger.info(f"Received {len(audio_bytes)} bytes as 'bytes' key")
-        elif isinstance(message, dict) and "text" in message:
-            logger.info(f"Received text message: {message['text'][:100]}")
-            await websocket.send_json({"text": "", "type": "transcription"})
-        else:
-            # Try to access the raw data
-            logger.warning(f"Message doesn't have expected keys. Trying to use as raw data.")
-            try:
+        # First receive the message
+        try:
+            # Get raw binary data directly
+            message = await websocket.receive()
+            logger.info(f"Received message type: {type(message)}")
+            
+            # Extract audio data based on message format
+            audio_bytes = None
+            
+            # Handle binary data in "bytes" key (websockets standard)
+            if isinstance(message, dict) and "bytes" in message:
+                audio_bytes = message["bytes"]
+                logger.info(f"Got {len(audio_bytes)} bytes from 'bytes' key")
+            
+            # Handle raw data
+            elif not isinstance(message, dict):
                 audio_bytes = message
-                if not isinstance(audio_bytes, bytes):
-                    logger.error(f"Not bytes type: {type(audio_bytes)}")
-                    await websocket.send_json({"error": "Invalid data format", "type": "error"})
-                    return
-                logger.info(f"Got {len(audio_bytes)} bytes of raw data")
-            except Exception as e:
-                logger.error(f"Failed to extract audio data: {e}")
-                await websocket.send_json({"error": "Failed to extract audio data", "type": "error"})
+                logger.info(f"Got raw data, type: {type(audio_bytes)}")
+            
+            # Handle case where message is a dict but doesn't have bytes key
+            else:
+                logger.info(f"Message is a dict with keys: {message.keys()}")
+                if "text" in message:
+                    logger.info(f"Got text message: {message['text'][:100]}")
+                
+                # Try to extract binary data anyway
+                for k, v in message.items():
+                    if isinstance(v, bytes):
+                        audio_bytes = v
+                        logger.info(f"Found binary data in key '{k}': {len(audio_bytes)} bytes")
+                        break
+            
+            # Check if we have audio data
+            if not audio_bytes or not isinstance(audio_bytes, bytes):
+                logger.error(f"No valid audio data found. Type: {type(audio_bytes)}")
+                await websocket.send_json({"error": "No valid audio data received", "type": "error"})
                 return
-        
-        if not audio_bytes:
-            logger.error("No audio data found in message")
-            await websocket.send_json({"error": "No audio data found", "type": "error"})
-            return
-            
-        # Process the audio data
-        logger.info(f"Processing {len(audio_bytes)} bytes of audio data")
-        
-        # Convert to float32 numpy array
-        try:
-            # Try as 16-bit PCM (most common for WAV)
-            audio_np = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-            logger.info(f"Converted audio: shape={audio_np.shape}, min={audio_np.min():.3f}, max={audio_np.max():.3f}")
+                
+            # Process the audio data with extensive error handling
+            try:
+                # Try to convert bytes to numpy array (WAV format)
+                logger.info(f"Processing {len(audio_bytes)} bytes of audio data")
+                
+                # Try different audio formats in case one fails
+                audio_np = None
+                
+                # Try int16 format (most common for WAV)
+                try:
+                    audio_np = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+                    logger.info(f"Successfully converted audio as int16. Shape: {audio_np.shape}")
+                except Exception as e1:
+                    logger.warning(f"Failed to convert as int16: {e1}")
+                    
+                    # Try float32 format
+                    try:
+                        audio_np = np.frombuffer(audio_bytes, dtype=np.float32)
+                        logger.info(f"Successfully converted audio as float32. Shape: {audio_np.shape}")
+                    except Exception as e2:
+                        logger.warning(f"Failed to convert as float32: {e2}")
+                        
+                        # Last resort - try with uint8
+                        try:
+                            audio_np = np.frombuffer(audio_bytes, dtype=np.uint8).astype(np.float32) / 255.0
+                            logger.info(f"Converted audio as uint8. Shape: {audio_np.shape}")
+                        except Exception as e3:
+                            logger.error(f"All audio conversion attempts failed: {e3}")
+                            await websocket.send_json({"error": "Audio conversion failed", "type": "error"})
+                            return
+                
+                # Make sure we have valid audio
+                if audio_np is None or len(audio_np) < 1000:
+                    logger.error(f"Audio too short or invalid: {len(audio_np) if audio_np is not None else 'None'}")
+                    await websocket.send_json({"error": "Audio too short or invalid", "type": "error"})
+                    return
+                
+                # Log audio stats
+                logger.info(f"Audio array: shape={audio_np.shape}, min={audio_np.min():.4f}, max={audio_np.max():.4f}")
+                
+                # Perform transcription with simplified parameters
+                try:
+                    logger.info("Starting transcription with simplified params...")
+                    
+                    # Use simplified parameters to reduce chance of errors
+                    segments, info = model.transcribe(
+                        audio_np, 
+                        beam_size=1,
+                        language="en",
+                        vad_filter=False  # Disable VAD to simplify processing
+                    )
+                    
+                    # Process segments
+                    segments_list = list(segments)
+                    text = " ".join([segment.text for segment in segments_list]).strip()
+                    logger.info(f"Transcription result: '{text}'")
+                    
+                    # Send success response
+                    await websocket.send_json({
+                        "text": text,
+                        "isFinal": True,
+                        "type": "transcription"
+                    })
+                    logger.info("Successfully sent transcription result")
+                    
+                except Exception as e:
+                    trace = traceback.format_exc()
+                    logger.error(f"Transcription failed: {e}\n{trace}")
+                    await websocket.send_json({"error": f"Transcription error: {str(e)}", "type": "error"})
+                
+            except Exception as e:
+                trace = traceback.format_exc()
+                logger.error(f"Audio processing error: {e}\n{trace}")
+                await websocket.send_json({"error": f"Processing error: {str(e)}", "type": "error"})
+                
         except Exception as e:
-            logger.error(f"Error converting audio: {e}")
-            await websocket.send_json({"error": f"Audio conversion failed: {e}", "type": "error"})
-            return
-        
-        # Perform transcription
-        try:
-            logger.info("Starting transcription...")
-            segments, info = model.transcribe(
-                audio_np,
-                beam_size=5,
-                language="en"
-            )
-            
-            segments_list = list(segments)
-            text = " ".join([segment.text for segment in segments_list]).strip()
-            logger.info(f"Transcribed text: '{text}'")
-            
-            # Send the result
-            await websocket.send_json({
-                "text": text,
-                "isFinal": True,
-                "type": "transcription"
-            })
-            logger.info("Sent transcription response successfully")
-            
-        except Exception as e:
-            error_msg = f"Transcription error: {str(e)}"
-            logger.error(error_msg, exc_info=True)
-            await websocket.send_json({
-                "error": error_msg,
-                "type": "error"
-            })
+            trace = traceback.format_exc()
+            logger.error(f"Error receiving message: {e}\n{trace}")
+            await websocket.send_json({"error": f"Message receiving error: {str(e)}", "type": "error"})
             
     except WebSocketDisconnect:
         logger.info(f"WebSocket disconnected: {connection_id}")
     except Exception as e:
-        error_msg = f"WebSocket error: {str(e)}"
-        logger.error(error_msg, exc_info=True)
-        try:
-            await websocket.send_json({"error": error_msg, "type": "error"})
-        except:
-            logger.error("Could not send error message to client")
+        trace = traceback.format_exc()
+        logger.error(f"WebSocket error: {e}\n{trace}")
     finally:
-        # Clean up connection buffer
         if connection_id in connection_buffers:
             del connection_buffers[connection_id]
         logger.info(f"WebSocket connection closed: {connection_id}")
